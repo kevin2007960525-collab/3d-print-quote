@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,20 @@ PRINTER_PRESETS = {
 }
 KINDS = ("machine", "process", "filament")
 MODEL_LIMIT = 35 * 1024 * 1024
+STEP_SUFFIXES = {".step", ".stp"}
+STEP_CONVERTER = Path(__file__).with_name("step_converter.py")
+BUILD_VOLUME_ERROR = "已超過所選機型的列印範圍。請確認尺寸、拆分模型，或改選可容納此零件的機型。"
+OUTSIDE_VOLUME = re.compile(
+    r"can\s*not be arranged inside (?:the )?plate|over the boundary of the heated bed|"
+    r"outside (?:of )?(?:the )?(?:print(?:able)? (?:volume|area)|build volume)|"
+    r"objects? (?:are |is )?(?:too (?:large|tall)|out(?:side)? of (?:the )?(?:plate|bed))|"
+    r"exceeds (?:the )?(?:maximum )?(?:printable|print|build) (?:height|volume|area)",
+    re.I,
+)
+
+
+class OutsideBuildVolume(ValueError):
+    pass
 
 
 def resolve_preset(folder, name, visited=()):
@@ -50,9 +65,7 @@ def load_profiles(resource_folder):
     return profiles
 
 
-def check_model(path):
-    if path.suffix == ".stl":
-        return
+def prepare_3mf(path):
     with zipfile.ZipFile(path) as archive:
         entries = archive.infolist()
         if len(entries) > 1024 or sum(item.file_size for item in entries) > 180 * 1024 * 1024:
@@ -66,6 +79,52 @@ def check_model(path):
                 if any(isinstance(config.get(k), list) and len(config[k]) > 1
                        for k in ("filament_type", "filament_settings_id")):
                     raise ValueError("自動切片目前支援單材料模型，請用單一耗材或匯出 STL。")
+        model_config = next((item for item in entries
+                             if item.filename.lower() == "metadata/model_settings.config"), None)
+        if not model_config:
+            return path
+        if model_config.file_size > 2 * 1024 * 1024:
+            raise ValueError("3MF 的模型設定過大，請簡化模型後再上傳。")
+        root = ET.fromstring(archive.read(model_config))
+        changed = False
+        for parent in root.iter():
+            for node in list(parent):
+                if node.tag == "metadata" and node.get("key") in {"enable_support", "support_type"}:
+                    parent.remove(node)
+                    changed = True
+        if not changed:
+            return path
+        target = path.with_name("normalized.3mf")
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as output:
+            for item in entries:
+                if item == model_config:
+                    output.writestr(item.filename, ET.tostring(root, encoding="utf-8", xml_declaration=True))
+                else:
+                    with archive.open(item) as source, output.open(item.filename, "w") as destination:
+                        shutil.copyfileobj(source, destination)
+        return target
+
+
+def convert_step(model):
+    target = model.with_suffix(".stl")
+    converted = subprocess.run(
+        [sys.executable, "-I", str(STEP_CONVERTER), str(model), str(target)],
+        capture_output=True, timeout=45, check=False,
+    )
+    if converted.returncode or not target.is_file():
+        print((converted.stderr + converted.stdout).decode("utf-8", "replace")[-1400:], flush=True)
+        raise ValueError("無法讀取這個 STEP 模型。請確認它包含有效的實體或曲面，再重新匯出。")
+    return target
+
+
+def step_available():
+    try:
+        return STEP_CONVERTER.is_file() and subprocess.run(
+            [sys.executable, "-I", str(STEP_CONVERTER), "--check"],
+            capture_output=True, timeout=15, check=False,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def read_metrics(path):
@@ -79,6 +138,8 @@ def read_metrics(path):
     plates = 0
     for plate in root.findall("plate"):
         metadata = {row.get("key"): row.get("value") for row in plate.findall("metadata")}
+        if metadata.get("outside") == "true":
+            raise OutsideBuildVolume(BUILD_VOLUME_ERROR)
         if not metadata.get("prediction") or not metadata.get("weight"):
             continue
         filaments = plate.findall("filament")
@@ -92,27 +153,31 @@ def read_metrics(path):
     return {"grams": round(grams, 6), "seconds": round(seconds, 6)}
 
 
-def slice_model(cli, profiles, data, filename, support):
-    if filename not in {"model.stl", "model.3mf"} or len(data) > MODEL_LIMIT:
+def slice_model(cli, profiles, data, filename):
+    if filename not in {"model.stl", "model.3mf", "model.step", "model.stp"} or len(data) > MODEL_LIMIT:
         raise ValueError("模型格式或大小不正確。")
     with tempfile.TemporaryDirectory(prefix="fdm-quote-") as temp:
         workdir = Path(temp)
         model = workdir / filename
         model.write_bytes(data)
-        check_model(model)
+        if model.suffix in STEP_SUFFIXES:
+            model = convert_step(model)
+        elif model.suffix == ".3mf":
+            model = prepare_3mf(model)
         settings = {}
         for kind, profile in profiles.items():
             config = dict(profile)
             if kind == "process":
                 config.update(layer_height="0.2", sparse_infill_density="15%",
-                              enable_support="1" if support == "on" else "0")
+                              enable_support="1", support_type="tree(auto)")
             settings[kind] = workdir / (kind + ".json")
             settings[kind].write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
         command = [
             str(cli), "--debug", "2", "--datadir", str(workdir / "cli-data"),
             "--load-settings", f"{settings['machine']};{settings['process']}",
             "--load-filaments", str(settings["filament"]), "--curr-bed-type", "Textured PEI Plate",
-            "--arrange", "1", "--ensure-on-bed", "--slice", "0",
+            "--enable-support=1", "--support-type=tree(auto)",
+            "--orient", "1", "--arrange", "1", "--ensure-on-bed", "--slice", "0",
             "--outputdir", str(workdir), "--export-3mf", "sliced.3mf", str(model),
         ]
         completed = subprocess.run(command, cwd=cli.parent, capture_output=True, timeout=255, check=False)
@@ -120,17 +185,24 @@ def slice_model(cli, profiles, data, filename, support):
         if completed.returncode or not output.is_file():
             details = (completed.stderr + completed.stdout).decode("utf-8", "replace")
             print(details[-2400:], flush=True)
+            report = workdir / "result.json"
+            if report.is_file():
+                details += "\n" + report.read_text(encoding="utf-8", errors="replace")
+            if OUTSIDE_VOLUME.search(details):
+                raise OutsideBuildVolume(BUILD_VOLUME_ERROR)
             raise ValueError("Bambu Studio 無法切片。請確認模型尺寸、朝向與完整性。")
         return read_metrics(output)
 
 
 class Client:
-    def __init__(self, origin, token, printers):
+    def __init__(self, origin, token, printers, accepts_step):
         self.origin = origin
         self.headers = {
             "Authorization": "Bearer " + token,
             "X-Worker-ID": uuid4().hex,
             "X-Worker-Printers": ",".join(printers),
+            "X-Worker-Protocol": "2",
+            "X-Worker-Step": "1" if accepts_step else "0",
         }
 
     def exchange(self, method, path, data=None):
@@ -153,11 +225,13 @@ def run(client, cli, profiles):
                 if future and future.done():
                     try:
                         result = future.result()
-                    except (ValueError, subprocess.TimeoutExpired, zipfile.BadZipFile, KeyError, ET.ParseError) as error:
+                    except (ValueError, OSError, subprocess.TimeoutExpired, zipfile.BadZipFile, KeyError, ET.ParseError) as error:
                         print("切片工作失敗：" + str(error), flush=True)
                         result = {"error": "切片失敗或輸出缺少有效資料，請在 Windows 檢查模型與 Bambu Studio。"}
                         if isinstance(error, ValueError):
                             result["error"] = str(error)[:240]
+                        if isinstance(error, OutsideBuildVolume):
+                            result["code"] = "OUTSIDE_BUILD_VOLUME"
                     try:
                         client.exchange("POST", "/api/worker/result/" + pending,
                                         json.dumps(result).encode("utf-8"))
@@ -172,8 +246,7 @@ def run(client, cli, profiles):
                     if status == 200:
                         pending = headers["X-Job-ID"]
                         preset = profiles[headers["X-Printer"]]
-                        future = executor.submit(slice_model, cli, preset, data,
-                                                 headers["X-Filename"], headers["X-Support"])
+                        future = executor.submit(slice_model, cli, preset, data, headers["X-Filename"])
             except (urllib.error.URLError, TimeoutError) as error:
                 print("橋接連線失敗：" + str(error), flush=True)
             time.sleep(4)
@@ -195,8 +268,10 @@ def main():
     if not profiles:
         sys.exit("沒有可用的 Bambu Studio 機型設定。請更新到同時包含 A1 mini 與 A2L 的版本。")
     print("Bambu Studio 切片橋接已啟動：" + ", ".join(profiles), flush=True)
+    accepts_step = step_available()
+    print("STEP 匯入已啟用。" if accepts_step else "STEP 尚未啟用。可在啟動時安裝 STEP 轉檔元件。", flush=True)
     try:
-        run(Client(origin, token, profiles), cli, profiles)
+        run(Client(origin, token, profiles, accepts_step), cli, profiles)
     except KeyboardInterrupt:
         print("Windows 切片橋接已停止。", flush=True)
 
